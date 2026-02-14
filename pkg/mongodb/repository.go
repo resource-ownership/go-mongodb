@@ -273,10 +273,10 @@ func (r *MongoDBRepository[T]) addLimit(pipe []bson.M, s shared.Search) ([]bson.
 	limit := s.ResultOptions.Limit
 
 	if limit <= 0 {
-		limit = DEFAULT_PAGE_SIZE // TODO: Parametrizar
+		limit = DEFAULT_PAGE_SIZE
 	}
 
-	if limit > MAX_PAGE_SIZE { // TODO: Parametrizar
+	if limit > MAX_PAGE_SIZE {
 		err := fmt.Errorf("given page size %d exceeds the maximum limit of %d records per request", s.ResultOptions.Limit, MAX_PAGE_SIZE)
 
 		return pipe, err
@@ -328,7 +328,10 @@ func (r *MongoDBRepository[T]) addSort(pipe []bson.M, s shared.Search) []bson.M 
 func (r *MongoDBRepository[T]) addMatch(queryCtx context.Context, pipe []bson.M, s shared.Search) ([]bson.M, error) {
 	aggregate := bson.M{}
 	for _, aggregator := range s.SearchParams {
-		r.setMatchValues(queryCtx, aggregator.Params, &aggregate, aggregator.AggregationClause)
+		if err := r.setMatchValues(queryCtx, aggregator.Params, &aggregate, aggregator.AggregationClause); err != nil {
+			slog.ErrorContext(queryCtx, "Pipeline (addMatch) aborted due to setMatchValues error", "err", err.Error())
+			return nil, err
+		}
 	}
 
 	aggregate, err := r.EnsureTenancy(queryCtx, aggregate, s)
@@ -342,10 +345,9 @@ func (r *MongoDBRepository[T]) addMatch(queryCtx context.Context, pipe []bson.M,
 	return pipe, nil
 }
 
-// TODO: return error instead of panic
-func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params []shared.SearchParameter, aggregate *bson.M, clause shared.SearchAggregationClause) {
+func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params []shared.SearchParameter, aggregate *bson.M, clause shared.SearchAggregationClause) error {
 	if r.QueryableFields == nil {
-		panic(fmt.Errorf("queryableFields not initialized in MongoDBRepository of %s", r.entityName))
+		return fmt.Errorf("queryableFields not initialized in MongoDBRepository of %s", r.entityName)
 	}
 
 	// outerClauses collects the result from each SearchParameter
@@ -366,15 +368,14 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 		for _, v := range p.ValueParams {
 			bsonFieldName, err := r.GetBSONFieldNameFromSearchableValue(v)
 			if err != nil {
-				panic(err) // Retain panic for irrecoverable errors
-				// slog.WarnContext(queryCtx, "setMatchValue GetBSONFieldNameFromSearchableValue", "err", err, "value", v)
+				return fmt.Errorf("setMatchValues: GetBSONFieldNameFromSearchableValue: %w", err)
 			}
 
 			// Check if the prefix is allowed
 			if strings.HasSuffix(v.Field, ".*") {
 				prefix := strings.TrimSuffix(v.Field, ".*")
 				if !isPrefixAllowed(prefix, r.QueryableFields) {
-					panic(fmt.Errorf("filtering on fields matching '%s.*' is not permitted", prefix))
+					return fmt.Errorf("filtering on fields matching '%s.*' is not permitted", prefix)
 				}
 			}
 
@@ -398,7 +399,7 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 		for _, d := range p.DateParams {
 			bsonFieldName, err := r.GetBSONFieldName(d.Field)
 			if err != nil {
-				panic(err) // Retain panic for irrecoverable reflection errors
+				return fmt.Errorf("setMatchValues: GetBSONFieldName (date): %w", err)
 			}
 
 			dateFilter := bson.M{}
@@ -415,7 +416,7 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 		for _, dur := range p.DurationParams {
 			bsonFieldName, err := r.GetBSONFieldName(dur.Field)
 			if err != nil {
-				panic(err) // Retain panic for irrecoverable reflection errors
+				return fmt.Errorf("setMatchValues: GetBSONFieldName (duration): %w", err)
 			}
 
 			durationFilter := bson.M{}
@@ -436,7 +437,9 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 				}
 
 				innerAggregate := bson.M{}
-				r.setMatchValues(queryCtx, v.Params, &innerAggregate, v.AggregationClause)
+				if err := r.setMatchValues(queryCtx, v.Params, &innerAggregate, v.AggregationClause); err != nil {
+					return err
+				}
 				innerClauses = append(innerClauses, innerAggregate)
 			}
 		}
@@ -472,6 +475,8 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 			(*aggregate)["$and"] = outerClauses
 		}
 	}
+
+	return nil
 }
 
 // Helper function to build the filter based on the operator
@@ -541,9 +546,7 @@ func (r *MongoDBRepository[T]) Create(ctx context.Context, entity *T) (*T, error
 		return nil, fmt.Errorf("RLS.Create: tenant_id is required in context")
 	}
 
-	// TODO: Validate that entity has correct resource ownership set
-	// This should be done by the application layer, but we could add validation here
-
+	// Note: Entity resource ownership validation is handled at the application/domain layer
 	_, err := r.collection.InsertOne(ctx, entity)
 	if err != nil {
 		slog.ErrorContext(ctx, err.Error())
@@ -695,7 +698,7 @@ func ensureClientID(ctx context.Context, agg bson.M, s shared.Search) (bson.M, e
 
 	tenancyOr := bson.A{
 		bson.M{"resource_owner.client_id": clientID},
-		bson.M{"baseentity.resource_owner.client_id": clientID}, // TODO: this OR on tenancy will degrade performance. choose to keep only base entity
+		bson.M{"baseentity.resource_owner.client_id": clientID}, // PERF: OR on tenancy degrades performance; consider keeping only baseentity path
 	}
 
 	slog.InfoContext(ctx, "TENANCY.ApplicationLevel: client_id", "client_id", clientID)
@@ -759,7 +762,7 @@ func ensureUserOrGroupID(ctx context.Context, agg bson.M, s shared.Search, aud s
 		tenancyOr = bson.A{
 			bson.M{"resource_owner.group_id": groupID},
 			bson.M{"resource_owner.user_id": userID},
-			bson.M{"baseentity.resource_owner.group_id": groupID}, // TODO: review, for performance reasons, use only baseentity
+			bson.M{"baseentity.resource_owner.group_id": groupID}, // PERF: OR on tenancy degrades performance; consider keeping only baseentity path
 			bson.M{"baseentity.resource_owner.user_id": userID},
 			bson.M{
 				"$or": bson.A{
@@ -780,7 +783,7 @@ func ensureUserOrGroupID(ctx context.Context, agg bson.M, s shared.Search, aud s
 				},
 			},
 			bson.M{"resource_owner.group_id": groupID},
-			bson.M{"baseentity.resource_owner.group_id": groupID}, // TODO: this OR on tenancy will degrade performance. choose to keep only base entity
+			bson.M{"baseentity.resource_owner.group_id": groupID}, // PERF: OR on tenancy degrades performance; consider keeping only baseentity path
 		}
 		slog.InfoContext(ctx, "TENANCY.GroupLevel: group_id", "group_id", groupID)
 	} else {
@@ -793,7 +796,7 @@ func ensureUserOrGroupID(ctx context.Context, agg bson.M, s shared.Search, aud s
 				},
 			},
 			bson.M{"resource_owner.user_id": userID},
-			bson.M{"baseentity.resource_owner.user_id": userID}, // TODO: this OR on tenancy will degrade performance. choose to keep only base entity
+			bson.M{"baseentity.resource_owner.user_id": userID}, // PERF: OR on tenancy degrades performance; consider keeping only baseentity path
 		}
 		slog.InfoContext(ctx, "TENANCY.UserLevel: user_id", "user_id", userID)
 	}
