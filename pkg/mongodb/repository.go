@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -495,11 +496,12 @@ func buildFilterForOperator(operator shared.SearchOperator, values []interface{}
 	case shared.LessThanOrEqualOperator:
 		return bson.M{"$lte": values[0]}
 	case shared.ContainsOperator:
-		return bson.M{"$regex": values[0], "$options": "i"}
+		// SECURITY: Escape regex metacharacters to prevent NoSQL regex injection / ReDoS
+		return bson.M{"$regex": regexp.QuoteMeta(fmt.Sprintf("%v", values[0])), "$options": "i"}
 	case shared.StartsWithOperator:
-		return bson.M{"$regex": "^" + fmt.Sprintf("%v", values[0]), "$options": "i"}
+		return bson.M{"$regex": "^" + regexp.QuoteMeta(fmt.Sprintf("%v", values[0])), "$options": "i"}
 	case shared.EndsWithOperator:
-		return bson.M{"$regex": fmt.Sprintf("%v", values[0]) + "$", "$options": "i"}
+		return bson.M{"$regex": regexp.QuoteMeta(fmt.Sprintf("%v", values[0])) + "$", "$options": "i"}
 	case shared.InOperator:
 		return bson.M{"$in": values}
 	case shared.NotInOperator:
@@ -1039,11 +1041,12 @@ func (r *MongoDBRepository[T]) DeleteOne(ctx context.Context, filter interface{}
 }
 
 // DeleteOneWithRLS performs a delete operation with RLS enforcement
+// SECURITY: Fails closed — if RLS filter cannot be built, the operation is rejected
 func (r *MongoDBRepository[T]) DeleteOneWithRLS(ctx context.Context, filter interface{}, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error) {
 	rlsFilter, err := r.buildRLSFilter(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "RLS.DeleteOneWithRLS: failed to build RLS filter, proceeding without RLS", "error", err)
-		return r.collection.DeleteOne(ctx, filter, opts...)
+		slog.ErrorContext(ctx, "RLS.DeleteOneWithRLS: failed to build RLS filter, rejecting operation (fail-closed)", "error", err)
+		return nil, fmt.Errorf("RLS filter required for delete operation: %w", err)
 	}
 
 	combinedFilter := bson.M{
@@ -1069,11 +1072,13 @@ func (r *MongoDBRepository[T]) FindOne(ctx context.Context, filter interface{}, 
 }
 
 // FindOneWithRLS performs a find one operation with RLS enforcement
+// SECURITY: Fails closed — if RLS filter cannot be built, returns an error result
 func (r *MongoDBRepository[T]) FindOneWithRLS(ctx context.Context, filter interface{}, opts ...*options.FindOneOptions) *mongo.SingleResult {
 	rlsFilter, err := r.buildRLSFilter(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "RLS.FindOneWithRLS: failed to build RLS filter, proceeding without RLS", "error", err)
-		return r.collection.FindOne(ctx, filter, opts...)
+		slog.ErrorContext(ctx, "RLS.FindOneWithRLS: failed to build RLS filter, rejecting operation (fail-closed)", "error", err)
+		// Return a SingleResult that will produce an error when decoded
+		return r.collection.FindOne(ctx, bson.M{"_id": "__rls_denied__"}, opts...)
 	}
 
 	combinedFilter := bson.M{
@@ -1093,11 +1098,12 @@ func (r *MongoDBRepository[T]) Find(ctx context.Context, filter interface{}, opt
 }
 
 // FindWithRLS performs a find operation with RLS enforcement
+// SECURITY: Fails closed — if RLS filter cannot be built, the operation is rejected
 func (r *MongoDBRepository[T]) FindWithRLS(ctx context.Context, filter interface{}, opts ...*options.FindOptions) (*mongo.Cursor, error) {
 	rlsFilter, err := r.buildRLSFilter(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "RLS.FindWithRLS: failed to build RLS filter, proceeding without RLS", "error", err)
-		return r.collection.Find(ctx, filter, opts...)
+		slog.ErrorContext(ctx, "RLS.FindWithRLS: failed to build RLS filter, rejecting operation (fail-closed)", "error", err)
+		return nil, fmt.Errorf("RLS filter required for find operation: %w", err)
 	}
 
 	combinedFilter := bson.M{
