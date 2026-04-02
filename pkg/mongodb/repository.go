@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	shared "github.com/resource-ownership/go-common/pkg/common"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -482,19 +483,31 @@ func (r *MongoDBRepository[T]) setMatchValues(queryCtx context.Context, params [
 
 // Helper function to build the filter based on the operator
 func buildFilterForOperator(operator shared.SearchOperator, values []interface{}) bson.M {
+	// Coerce string values that look like UUIDs to proper uuid.UUID for BSON binary matching
+	coercedValues := make([]interface{}, len(values))
+	for i, v := range values {
+		if str, ok := v.(string); ok {
+			if parsed, err := uuid.Parse(str); err == nil {
+				coercedValues[i] = primitive.Binary{Subtype: 0x04, Data: parsed[:]}
+				continue
+			}
+		}
+		coercedValues[i] = v
+	}
+
 	switch operator {
 	case shared.EqualsOperator:
-		return bson.M{"$eq": values[0]}
+		return bson.M{"$eq": coercedValues[0]}
 	case shared.NotEqualsOperator:
-		return bson.M{"$ne": values[0]}
+		return bson.M{"$ne": coercedValues[0]}
 	case shared.GreaterThanOperator:
-		return bson.M{"$gt": values[0]}
+		return bson.M{"$gt": coercedValues[0]}
 	case shared.LessThanOperator:
-		return bson.M{"$lt": values[0]}
+		return bson.M{"$lt": coercedValues[0]}
 	case shared.GreaterThanOrEqualOperator:
-		return bson.M{"$gte": values[0]}
+		return bson.M{"$gte": coercedValues[0]}
 	case shared.LessThanOrEqualOperator:
-		return bson.M{"$lte": values[0]}
+		return bson.M{"$lte": coercedValues[0]}
 	case shared.ContainsOperator:
 		// SECURITY: Escape regex metacharacters to prevent NoSQL regex injection / ReDoS
 		return bson.M{"$regex": regexp.QuoteMeta(fmt.Sprintf("%v", values[0])), "$options": "i"}
@@ -503,11 +516,11 @@ func buildFilterForOperator(operator shared.SearchOperator, values []interface{}
 	case shared.EndsWithOperator:
 		return bson.M{"$regex": regexp.QuoteMeta(fmt.Sprintf("%v", values[0])) + "$", "$options": "i"}
 	case shared.InOperator:
-		return bson.M{"$in": values}
+		return bson.M{"$in": coercedValues}
 	case shared.NotInOperator:
-		return bson.M{"$nin": values}
+		return bson.M{"$nin": coercedValues}
 	default:
-		return bson.M{"$in": values}
+		return bson.M{"$in": coercedValues}
 	}
 }
 
